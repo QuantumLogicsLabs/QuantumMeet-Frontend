@@ -3,8 +3,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { createRealtimeClient } from '../lib/realtimeClient';
 import styles from './Home.module.css';
+import { API } from '../lib/api';
 
-const API = process.env.REACT_APP_SERVER_URL || 'http://localhost:5000';
 
 function getUserId() {
   let id = localStorage.getItem('qm_userId');
@@ -65,7 +65,11 @@ export default function Home() {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId, hostName: userName, isPublic: roomType === 'public', title: meetingTitle || `${userName}'s Meeting` }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.roomId) {
+        setError(data.error ? `Could not create room: ${data.error}` : 'Failed to create room. Please try again.');
+        return;
+      }
       setCreatedData(data);
       localStorage.setItem('qm_userName', userName);
       localStorage.setItem(`qm_host_${data.roomId}`, '1');

@@ -1,5 +1,6 @@
 import React, { useState } from "react";
 import styles from "./SettingsPanel.module.css";
+import { API } from "../lib/api";
 
 export default function SettingsPanel({
   peers,
@@ -14,7 +15,6 @@ export default function SettingsPanel({
   const [tab, setTab] = useState("participants");
   const [purgeState, setPurgeState] = useState("");
   const emit = (ev, data) => socket?.emit(ev, { roomId, ...data });
-  const API = process.env.REACT_APP_SERVER_URL || "http://localhost:5000";
 
   const purgeRoom = async () => {
     if (

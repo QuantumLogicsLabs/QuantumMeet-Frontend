@@ -3,8 +3,8 @@ import React, { useState, useEffect, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import { useAuth } from "../../context/AuthContext";
 import styles from "./ClassroomDashboard.module.css";
+import { API } from "../../lib/api";
 
-const API = process.env.REACT_APP_SERVER_URL || "http://localhost:5000";
 
 const THEMES = {
   cyan: { accent: "#00e5ff", bg: "linear-gradient(135deg,#071828,#0a2a3a)" },

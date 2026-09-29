@@ -2,8 +2,8 @@ import React, { useState } from "react";
 import { useNavigate, Link } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import styles from "./Auth.module.css";
+import { API } from "../lib/api";
 
-const API = process.env.REACT_APP_SERVER_URL || "http://localhost:5000";
 
 export default function Login() {
   const { login } = useAuth();

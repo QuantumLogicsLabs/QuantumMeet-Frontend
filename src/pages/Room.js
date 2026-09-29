@@ -18,8 +18,8 @@ import BreakoutPanel from "../components/BreakoutPanel";
 import PollPanel from "../components/PollPanel";
 import QnAPanel from "../components/QnAPanel";
 import styles from "./Room.module.css";
+import { API } from "../lib/api";
 
-const API = process.env.REACT_APP_SERVER_URL || "http://localhost:5000";
 
 export default function Room() {
   const { roomId } = useParams();

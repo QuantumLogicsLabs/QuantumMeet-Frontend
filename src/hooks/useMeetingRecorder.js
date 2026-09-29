@@ -5,8 +5,8 @@
  */
 import { useRef, useState, useCallback } from "react";
 import { upload as blobUpload } from "@vercel/blob/client";
+import { API } from "../lib/api";
 
-const API = process.env.REACT_APP_SERVER_URL || "http://localhost:5000";
 
 export function useMeetingRecorder({
   localStream,

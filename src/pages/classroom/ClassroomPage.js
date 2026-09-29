@@ -3,8 +3,8 @@ import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { upload as blobUpload } from '@vercel/blob/client';
 import styles from './ClassroomPage.module.css';
+import { API } from '../../lib/api';
 
-const API = process.env.REACT_APP_SERVER_URL || 'http://localhost:5000';
 
 // Files upload straight to Vercel Blob from the browser (serverless functions
 // cap request bodies well under the 50MB this app allows) — this only sends

@@ -9,13 +9,21 @@ import {
   mediaModeFromPermissions,
 } from "../lib/mediaPermissions";
 import { addSimulcastVideoTrack, setSenderBandwidthTier } from "../lib/simulcast";
+import { API } from "../lib/api";
 
 export let MESH_SOFT_CAP = Number(process.env.REACT_APP_MESH_SOFT_CAP || 10);
+
+function reportCallQuality(event) {
+  fetch(`${API}/api/metrics/call-quality`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ event }),
+  }).catch(() => {});
+}
 
 /** Prefer server `/api/growth/features` meshSoftCap when available. */
 export async function refreshMeshSoftCap() {
   try {
-    const API = process.env.REACT_APP_SERVER_URL || "http://localhost:5000";
     const res = await fetch(`${API}/api/growth/features`);
     if (!res.ok) return { meshSoftCap: MESH_SOFT_CAP };
     const data = await res.json();
@@ -67,6 +75,20 @@ async function buildEnhancedAudioStream(rawStream) {
     dest.stream.getAudioTracks().forEach((t) => enhancedStream.addTrack(t));
     rawStream.getVideoTracks().forEach((t) => enhancedStream.addTrack(t));
     enhancedStream._audioCtx = audioCtx;
+    // The raw mic track isn't part of enhancedStream — keep it so cleanup can
+    // stop it (otherwise the browser's mic indicator stays on after leaving).
+    enhancedStream._rawStream = rawStream;
+    // A context created without a user gesture starts suspended and outputs
+    // silence, so peers would hear nothing. Resume now and on first interaction.
+    if (audioCtx.state === "suspended") {
+      const resume = () => {
+        if (audioCtx.state === "suspended") audioCtx.resume().catch(() => {});
+      };
+      resume();
+      ["pointerdown", "keydown", "touchstart"].forEach((ev) =>
+        window.addEventListener(ev, resume, { once: true, capture: true }),
+      );
+    }
     return enhancedStream;
   } catch (err) {
     console.warn("Audio enhancement failed, falling back to raw stream:", err);
@@ -191,12 +213,12 @@ export const useWebRTC = ({ socket, roomId, userId, userName }) => {
   }, []);
 
   // ── Renegotiate ──────────────────────────────────────────────────────────────
-  const renegotiate = useCallback(async (sid) => {
+  const renegotiate = useCallback(async (sid, offerOptions) => {
     const pc = peersRef.current[sid];
     const s = socketRef.current;
     if (!pc || !s || pc.signalingState === "closed") return;
     try {
-      const offer = await pc.createOffer();
+      const offer = await pc.createOffer(offerOptions);
       await pc.setLocalDescription(offer);
       s.emit("offer", {
         to: sid,
@@ -407,56 +429,34 @@ export const useWebRTC = ({ socket, roomId, userId, userName }) => {
             delete disconnectTimersRef.current[sid];
           }
           setIsReconnecting(false);
-          try {
-            fetch(
-              `${process.env.REACT_APP_SERVER_URL || ""}/api/metrics/call-quality`,
-              {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ event: "reconnect_ok" }),
-              },
-            );
-          } catch {
-            /* ignore */
-          }
+          reportCallQuality("reconnect_ok");
           // Feature 9: start quality polling when connection is established
           startQualityPolling(pc, sid);
           return;
         }
 
+        // pc.restartIce() alone only flags the need — nothing here listens for
+        // `negotiationneeded`, so send the ICE-restart offer explicitly.
+        // Simultaneous restarts from both ends are resolved in handleOffer.
         if (pc.connectionState === "disconnected") {
           setIsReconnecting(true);
           if (disconnectTimersRef.current[sid]) return;
-          try {
-            pc.restartIce();
-          } catch {}
+          renegotiate(sid, { iceRestart: true });
           disconnectTimersRef.current[sid] = setTimeout(() => {
+            delete disconnectTimersRef.current[sid];
             const current = peersRef.current[sid];
             if (!current || current.connectionState !== "disconnected") return;
             console.warn(`[WebRTC] peer ${sid} did not recover, removing.`);
             removePeer(sid);
             setIsReconnecting(false);
-            try {
-              fetch(
-                `${process.env.REACT_APP_SERVER_URL || ""}/api/metrics/call-quality`,
-                {
-                  method: "POST",
-                  headers: { "Content-Type": "application/json" },
-                  body: JSON.stringify({ event: "reconnect_fail" }),
-                },
-              );
-            } catch {
-              /* ignore */
-            }
+            reportCallQuality("reconnect_fail");
           }, 8000);
           return;
         }
 
         if (pc.connectionState === "failed") {
           setIsReconnecting(true);
-          try {
-            pc.restartIce();
-          } catch {}
+          renegotiate(sid, { iceRestart: true });
           if (!disconnectTimersRef.current[`fail_${sid}`]) {
             disconnectTimersRef.current[`fail_${sid}`] = setTimeout(() => {
               delete disconnectTimersRef.current[`fail_${sid}`];
@@ -464,20 +464,9 @@ export const useWebRTC = ({ socket, roomId, userId, userName }) => {
               if (current && current.connectionState === "failed") {
                 removePeer(sid);
                 setIsReconnecting(false);
-                try {
-                  fetch(
-                    `${process.env.REACT_APP_SERVER_URL || ""}/api/metrics/call-quality`,
-                    {
-                      method: "POST",
-                      headers: { "Content-Type": "application/json" },
-                      body: JSON.stringify({ event: "reconnect_fail" }),
-                    },
-                  );
-                } catch {
-                  /* ignore */
-                }
+                reportCallQuality("reconnect_fail");
               }
-            }, 5000);
+            }, 8000);
           }
           return;
         }
@@ -492,7 +481,7 @@ export const useWebRTC = ({ socket, roomId, userId, userName }) => {
       peersRef.current[sid] = pc;
       return pc;
     },
-    [removePeer, startQualityPolling, stopQualityPolling],
+    [removePeer, startQualityPolling, stopQualityPolling, renegotiate],
   );
 
   // ── Flush pending ICE ────────────────────────────────────────────────────────
@@ -554,6 +543,12 @@ export const useWebRTC = ({ socket, roomId, userId, userName }) => {
         pc = createPeerConnection(from, rName);
       try {
         if (pc.signalingState === "have-local-offer") {
+          // Offer collision (rejoin, simultaneous ICE restart). If *both* ends
+          // roll back, each applies the other's discarded offer and the call
+          // never connects — so only the "polite" peer (lower id) yields; the
+          // other keeps its offer and waits for the answer.
+          const polite = String(socket.id) < String(from);
+          if (!polite) return;
           await pc.setLocalDescription({ type: "rollback" });
         }
         await pc.setRemoteDescription(new RTCSessionDescription(offer));
@@ -752,6 +747,7 @@ export const useWebRTC = ({ socket, roomId, userId, userName }) => {
     if (localStreamRef.current?._audioCtx) {
       localStreamRef.current._audioCtx.close().catch(() => {});
     }
+    localStreamRef.current?._rawStream?.getTracks().forEach((t) => t.stop());
     localStreamRef.current?.getTracks().forEach((t) => t.stop());
     screenStreamRef.current?.getTracks().forEach((t) => t.stop());
     localStreamRef.current = null;
