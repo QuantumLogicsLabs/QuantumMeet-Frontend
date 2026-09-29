@@ -1,8 +1,13 @@
 /**
  * Minimal PWA service worker — cache shell for offline browse (not media).
+ *
+ * Pages are network-first: serving a cached index.html first (the old
+ * behaviour) pointed users at JS bundles that no longer exist after a new
+ * Vercel deploy, which rendered a blank page. Hashed /static assets are
+ * immutable, so cache-first is safe for those.
  */
-const CACHE = "qm-shell-v1";
-const PRECACHE = ["/", "/manifest.json", "/logo.png"];
+const CACHE = "qm-shell-v2";
+const PRECACHE = ["/manifest.json", "/logo.png"];
 
 self.addEventListener("install", (event) => {
   event.waitUntil(
@@ -26,18 +31,34 @@ self.addEventListener("fetch", (event) => {
   // Never cache API / media
   if (url.pathname.startsWith("/api")) return;
 
-  event.respondWith(
-    caches.match(request).then((cached) => {
-      const fetchPromise = fetch(request)
+  if (request.mode === "navigate") {
+    event.respondWith(
+      fetch(request)
         .then((res) => {
-          if (res.ok && request.destination === "document") {
+          if (res.ok) {
             const copy = res.clone();
-            caches.open(CACHE).then((c) => c.put(request, copy));
+            caches.open(CACHE).then((c) => c.put("/", copy));
           }
           return res;
         })
-        .catch(() => cached);
-      return cached || fetchPromise;
-    }),
-  );
+        .catch(() => caches.match("/")),
+    );
+    return;
+  }
+
+  if (url.pathname.startsWith("/static/")) {
+    event.respondWith(
+      caches.match(request).then(
+        (cached) =>
+          cached ||
+          fetch(request).then((res) => {
+            if (res.ok) {
+              const copy = res.clone();
+              caches.open(CACHE).then((c) => c.put(request, copy));
+            }
+            return res;
+          }),
+      ),
+    );
+  }
 });

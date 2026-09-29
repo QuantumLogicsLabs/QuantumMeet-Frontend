@@ -65,7 +65,11 @@ export default function Home() {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ userId, hostName: userName, isPublic: roomType === 'public', title: meetingTitle || `${userName}'s Meeting` }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.roomId) {
+        setError(data.error ? `Could not create room: ${data.error}` : 'Failed to create room. Please try again.');
+        return;
+      }
       setCreatedData(data);
       localStorage.setItem('qm_userName', userName);
       localStorage.setItem(`qm_host_${data.roomId}`, '1');
