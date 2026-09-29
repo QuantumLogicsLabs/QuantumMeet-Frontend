@@ -3,7 +3,7 @@
  * Prefer GET /api/ice (server ICE_SERVERS); fall back to REACT_APP_ICE_SERVERS / STUN.
  */
 
-const API = process.env.REACT_APP_SERVER_URL || "http://localhost:5000";
+import { API } from "./api";
 
 const DEFAULT_STUN = [
   { urls: "stun:stun.l.google.com:19302" },

@@ -3,8 +3,8 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { createRealtimeClient } from '../lib/realtimeClient';
 import styles from './Home.module.css';
+import { API } from '../lib/api';
 
-const API = process.env.REACT_APP_SERVER_URL || 'http://localhost:5000';
 
 function getUserId() {
   let id = localStorage.getItem('qm_userId');

@@ -2,8 +2,8 @@ import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import styles from "./Orgs.module.css";
+import { API } from "../lib/api";
 
-const API = process.env.REACT_APP_SERVER_URL || "http://localhost:5000";
 
 /** Lightweight admin console (E-406): owner-facing org overview. */
 export default function AdminPage() {

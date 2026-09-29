@@ -2,8 +2,8 @@ import React, { useEffect, useState, useCallback } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../context/AuthContext";
 import styles from "./Orgs.module.css";
+import { API } from "../lib/api";
 
-const API = process.env.REACT_APP_SERVER_URL || "http://localhost:5000";
 
 export default function OrgsPage() {
   const { user, authFetch, logout } = useAuth();

@@ -1,6 +1,5 @@
 import { v4 as uuidv4 } from "uuid";
-
-const API = process.env.REACT_APP_SERVER_URL || "http://localhost:5000";
+import { API } from "./api";
 
 // Vercel can't host Socket.io. Signaling + room fan-out use a Mongo-backed
 // event bus polled over REST. Media stays WebRTC P2P. This factory keeps the
@@ -11,11 +10,15 @@ const POLL_MS_IDLE = 3000;
 const POLL_MS_ACTIVE = 600;
 const POLL_MS_NEGOTIATING = 300;
 const HEARTBEAT_MS = 15_000;
-const LONG_POLL_WAIT_MS = 15000;
+// Server caps waits at 7s so requests fit Vercel's 10s function timeout.
+const LONG_POLL_WAIT_MS = 7000;
+const MAX_BACKOFF_MS = 15_000;
 const CURSOR_COALESCE_MS = 150;
 const ICE_COALESCE_MS = 100;
 const DRAW_COALESCE_MS = 50;
 const DRAW_BATCH_MAX = 40;
+// Server rejects event payloads over 120 KB (413).
+const MAX_EVENT_PAYLOAD_CHARS = 110_000;
 
 const SIGNALING_EVENTS = new Set([
   "offer",
@@ -99,8 +102,17 @@ export function createRealtimeClient({ roomId, userId, userName, roomToken }) {
   const connectionId = uuidv4();
   let hasEnteredPresence = false;
   let closed = false;
-  let roomSince = new Date().toISOString();
-  let secretSince = new Date().toISOString();
+  // Event cursors are compared against *server* timestamps. Starting them from
+  // this device's clock drops every event (offers, knock-accepted…) for as long
+  // as the clock runs fast, so they're re-based on server time before polling.
+  const createdAtMs = Date.now();
+  let clockOffsetMs = 0;
+  let clockSynced = false;
+  let roomSince = new Date(createdAtMs).toISOString();
+  let secretSince = roomSince;
+  let roomCursorFromServer = false;
+  let secretCursorFromServer = false;
+  let pollFailures = 0;
   let pollTimer = null;
   let heartbeatTimer = null;
   let cursorTimer = null;
@@ -116,10 +128,11 @@ export function createRealtimeClient({ roomId, userId, userName, roomToken }) {
   let token = roomToken || (roomId ? localStorage.getItem(`qm_room_token_${roomId}`) : null);
   let tabVisible = typeof document === "undefined" || document.visibilityState !== "hidden";
 
+  const onVisibilityChange = () => {
+    tabVisible = document.visibilityState !== "hidden";
+  };
   if (typeof document !== "undefined") {
-    document.addEventListener("visibilitychange", () => {
-      tabVisible = document.visibilityState !== "hidden";
-    });
+    document.addEventListener("visibilitychange", onVisibilityChange);
   }
 
   const setRoomToken = (t) => {
@@ -170,14 +183,25 @@ export function createRealtimeClient({ roomId, userId, userName, roomToken }) {
     const batch = pendingIce;
     pendingIce = [];
     if (!batch.length) return;
-    // Send last candidate per peer target to cut bus chatter
+    // One bus event per peer carrying *every* candidate gathered in the window.
+    // Candidates don't supersede each other (host / srflx / relay are separate
+    // routes) — keeping only the last one per peer broke calls across NATs.
     const byTo = new Map();
     for (const p of batch) {
-      const key = p?.to || "_";
-      byTo.set(key, p);
+      if (!p?.candidate) continue;
+      const key = p.to || "_";
+      if (!byTo.has(key)) byTo.set(key, []);
+      byTo.get(key).push(p);
     }
-    for (const p of byTo.values()) {
-      publishEvent("ice-candidate", p).catch(() => {});
+    for (const list of byTo.values()) {
+      const last = list[list.length - 1];
+      publishEvent("ice-candidate", {
+        to: last.to,
+        from: last.from,
+        // `candidate` keeps clients still on an older bundle working.
+        candidate: last.candidate,
+        candidates: list.map((p) => p.candidate),
+      }).catch(() => {});
     }
   };
 
@@ -233,15 +257,27 @@ export function createRealtimeClient({ roomId, userId, userName, roomToken }) {
       if (!drawTimer) drawTimer = setTimeout(flushDraws, DRAW_COALESCE_MS);
       return;
     }
-    // Skip empty canvas dumps
+    // Skip canvas dumps the API would reject as too large
     if (event === "wb-canvas-state" && payload?.json) {
       try {
-        if (JSON.stringify(payload.json).length > 200_000) return;
+        if (JSON.stringify(payload).length > MAX_EVENT_PAYLOAD_CHARS) return;
       } catch {
         return;
       }
     }
     publishEvent(event, payload).catch(() => {});
+  };
+
+  const dispatchBusEvent = (ev) => {
+    const p = ev.payload;
+    // Batched ICE (see flushIce) fans back out to one handler call per candidate
+    if (ev.event === "ice-candidate" && Array.isArray(p?.candidates)) {
+      for (const candidate of p.candidates) {
+        dispatch("ice-candidate", { to: p.to, from: p.from, candidate });
+      }
+      return;
+    }
+    dispatch(ev.event, p);
   };
 
   const pollOnce = async () => {
@@ -251,26 +287,37 @@ export function createRealtimeClient({ roomId, userId, userName, roomToken }) {
       if (roomId) {
         const q = new URLSearchParams({ userId, since: roomSince });
         // Long-poll only when tab visible — cuts idle serverless load
-        if (useLongPoll && tabVisible) q.set("wait", String(LONG_POLL_WAIT_MS));
+        const wantLongPoll = useLongPoll && tabVisible;
+        if (wantLongPoll) q.set("wait", String(LONG_POLL_WAIT_MS));
         const data = await getJSON(`/api/rooms/${roomId}/events?${q}`);
-        if (data?.events?.length) {
-          for (const ev of data.events) {
-            dispatch(ev.event, ev.payload);
-            if (ev.createdAt > roomSince) roomSince = ev.createdAt;
+        if (!data) throw new Error("poll failed");
+        // An API that answered without waiting (flag off / older deploy) would
+        // otherwise be re-polled every 80ms by every open tab.
+        if (wantLongPoll && data.longPoll !== true) useLongPoll = false;
+        for (const ev of data.events || []) {
+          dispatchBusEvent(ev);
+          if (ev.createdAt > roomSince) {
+            roomSince = ev.createdAt;
+            roomCursorFromServer = true;
           }
         }
       } else {
         const q = new URLSearchParams({ userId, since: secretSince });
         const data = await getJSON(`/api/secret/inbox?${q}`);
-        if (data?.events?.length) {
-          for (const ev of data.events) {
-            dispatch(ev.event, ev.payload);
-            if (ev.createdAt > secretSince) secretSince = ev.createdAt;
+        if (!data) throw new Error("poll failed");
+        for (const ev of data.events || []) {
+          dispatch(ev.event, ev.payload);
+          if (ev.createdAt > secretSince) {
+            secretSince = ev.createdAt;
+            secretCursorFromServer = true;
           }
         }
       }
+      pollFailures = 0;
     } catch (e) {
-      useLongPoll = false; // fall back to short poll on transport errors
+      pollFailures += 1;
+      // Repeated long-poll failures: drop to plain interval polling
+      if (pollFailures >= 3) useLongPoll = false;
     } finally {
       polling = false;
     }
@@ -278,8 +325,11 @@ export function createRealtimeClient({ roomId, userId, userName, roomToken }) {
 
   const scheduleNextPoll = () => {
     if (closed) return;
-    const delay =
-      useLongPoll && roomId && tabVisible ? 80 : currentPollMs();
+    const delay = pollFailures
+      ? Math.min(POLL_MS_IDLE * 2 ** (pollFailures - 1), MAX_BACKOFF_MS)
+      : useLongPoll && roomId && tabVisible
+        ? 80
+        : currentPollMs();
     pollTimer = setTimeout(async () => {
       await pollOnce();
       scheduleNextPoll();
@@ -293,8 +343,9 @@ export function createRealtimeClient({ roomId, userId, userName, roomToken }) {
 
   const startHeartbeat = () => {
     if (heartbeatTimer || !roomId) return;
+    // Beat in background tabs too: the server drops members after 45s without
+    // one, which kicked people out of the call just for switching tabs / PiP.
     const beat = () => {
-      if (!tabVisible) return; // hidden tabs don't refresh presence (stale GC handles leave)
       postJSON(`/api/rooms/${roomId}/presence`, {
         userId,
         userName,
@@ -306,23 +357,39 @@ export function createRealtimeClient({ roomId, userId, userName, roomToken }) {
   };
 
   // Leave presence on tab close / navigate away (multi-tab safe via connectionId)
+  const onPageHide = () => {
+    if (!hasEnteredPresence || closed) return;
+    const body = JSON.stringify({ userId, userName, connectionId });
+    try {
+      fetch(`${API}/api/rooms/${roomId}/presence`, {
+        method: "DELETE",
+        headers: { "Content-Type": "application/json" },
+        body,
+        keepalive: true,
+      }).catch(() => {});
+    } catch {
+      /* ignore */
+    }
+  };
   if (typeof window !== "undefined" && roomId) {
-    const onPageHide = () => {
-      if (!hasEnteredPresence) return;
-      const body = JSON.stringify({ userId, userName, connectionId });
-      try {
-        fetch(`${API}/api/rooms/${roomId}/presence`, {
-          method: "DELETE",
-          headers: { "Content-Type": "application/json" },
-          body,
-          keepalive: true,
-        }).catch(() => {});
-      } catch {
-        /* ignore */
-      }
-    };
     window.addEventListener("pagehide", onPageHide);
   }
+
+  const syncClock = async () => {
+    try {
+      const t0 = Date.now();
+      const res = await fetch(`${API}/api/time`);
+      if (!res.ok) return;
+      const { serverTime } = await res.json();
+      const server = Date.parse(serverTime);
+      if (Number.isFinite(server)) {
+        clockOffsetMs = server - (t0 + Date.now()) / 2;
+        clockSynced = true;
+      }
+    } catch {
+      /* older API without /api/time — keep the local clock */
+    }
+  };
 
   const enterPresenceAndHydrate = async () => {
     const result = await postJSON(`/api/rooms/${roomId}/presence`, {
@@ -332,6 +399,14 @@ export function createRealtimeClient({ roomId, userId, userName, roomToken }) {
     });
     hasEnteredPresence = true;
     startHeartbeat();
+
+    // Deliver everything peers publish from the moment we entered (server
+    // clock). Moving the cursor *after* the awaits below used to drop answers
+    // and ICE that peers sent while this client was still hydrating.
+    if (result?.since && (!roomCursorFromServer || result.since > roomSince)) {
+      roomSince = result.since;
+      roomCursorFromServer = true;
+    }
 
     const members = result?.members || (await getJSON(`/api/rooms/${roomId}/presence`)) || [];
     const peers = members
@@ -375,9 +450,6 @@ export function createRealtimeClient({ roomId, userId, userName, roomToken }) {
 
     const history = await getJSON(`/api/rooms/${roomId}/chat`);
     dispatch("chat-history", history || []);
-
-    // Skip historical join/leave fan-out already reflected in existing-peers
-    roomSince = new Date().toISOString();
   };
 
   async function restDispatch(event, data) {
@@ -641,6 +713,12 @@ export function createRealtimeClient({ roomId, userId, userName, roomToken }) {
       }
       pollTimer = heartbeatTimer = cursorTimer = iceTimer = drawTimer = null;
       pendingDraws = [];
+      if (typeof document !== "undefined") {
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      }
+      if (typeof window !== "undefined") {
+        window.removeEventListener("pagehide", onPageHide);
+      }
       if (hasEnteredPresence && roomId) {
         delJSON(`/api/rooms/${roomId}/presence`, {
           userId,
@@ -654,11 +732,20 @@ export function createRealtimeClient({ roomId, userId, userName, roomToken }) {
 
   // Room clients poll immediately; SecretMeet (no roomId) starts on queue join
   // but also poll inbox so a late subscribe still works if emit order varies.
-  queueMicrotask(() => {
+  // Cursors are re-based on the server clock first (see clockOffsetMs).
+  syncClock().finally(() => {
     if (closed) return;
+    if (clockSynced) {
+      // Server-clock estimate of when this client was created
+      const start = new Date(createdAtMs + clockOffsetMs).toISOString();
+      if (!roomCursorFromServer) {
+        roomSince = start;
+        roomCursorFromServer = true;
+      }
+      if (!secretCursorFromServer) secretSince = start;
+    }
     dispatch("connect");
-    if (roomId) startPolling();
-    else startPolling();
+    startPolling();
   });
 
   return socketLike;
